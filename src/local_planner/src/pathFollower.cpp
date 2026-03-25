@@ -1,38 +1,39 @@
-#include <time.h>
+#include <algorithm>
+#include <chrono>
 #include <stdio.h>
 #include <stdlib.h>
-#include <chrono>
+#include <time.h>
 
+#include "builtin_interfaces/msg/time.hpp"
+#include "rclcpp/clock.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/time.hpp"
-#include "rclcpp/clock.hpp"
-#include "builtin_interfaces/msg/time.hpp"
 
 #include "nav_msgs/msg/odometry.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include <geometry_msgs/msg/twist_stamped.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <sensor_msgs/msg/imu.h>
 #include <sensor_msgs/msg/joy.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/int8.hpp>
-#include <nav_msgs/msg/path.hpp>
-#include <geometry_msgs/msg/twist_stamped.hpp>
-#include <sensor_msgs/msg/imu.h>
 
 #include "tf2/transform_datatypes.h"
-#include "tf2_ros/transform_broadcaster.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "tf2_ros/transform_broadcaster.h"
 
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree_flann.h>
-#include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
 
 #include "message_filters/subscriber.h"
-#include "message_filters/synchronizer.h"
 #include "message_filters/sync_policies/approximate_time.h"
-#include "rmw/types.h"
+#include "message_filters/synchronizer.h"
 #include "rmw/qos_profiles.h"
+#include "rmw/types.h"
 
 using namespace std;
 
@@ -67,6 +68,7 @@ bool noRotAtGoal = true;
 bool autonomyMode = false;
 double autonomySpeed = 1.0;
 double joyToSpeedDelay = 2.0;
+bool offsetLookAheadBySensor = false;
 
 float joySpeed = 0;
 float joySpeedRaw = 0;
@@ -99,34 +101,46 @@ bool pathInit = false;
 bool navFwd = true;
 double switchTime = 0;
 
+double dirMomentum = 0.0;
+double lastDiffDir = 0;
+const double EPS = 1e-5;
+
+std::string odomTopic = "/state_estimation";
+std::string commandTopic = "/cmd_vel";
+
 nav_msgs::msg::Path path;
 rclcpp::Node::SharedPtr nh;
 
-void odomHandler(const nav_msgs::msg::Odometry::ConstSharedPtr odomIn)
-{
+void odomHandler(const nav_msgs::msg::Odometry::ConstSharedPtr odomIn) {
   odomTime = rclcpp::Time(odomIn->header.stamp).seconds();
   double roll, pitch, yaw;
   geometry_msgs::msg::Quaternion geoQuat = odomIn->pose.pose.orientation;
-  tf2::Matrix3x3(tf2::Quaternion(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w)).getRPY(roll, pitch, yaw);
+  tf2::Matrix3x3(tf2::Quaternion(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w))
+      .getRPY(roll, pitch, yaw);
 
   vehicleRoll = roll;
   vehiclePitch = pitch;
   vehicleYaw = yaw;
-  vehicleX = odomIn->pose.pose.position.x - cos(yaw) * sensorOffsetX + sin(yaw) * sensorOffsetY;
-  vehicleY = odomIn->pose.pose.position.y - sin(yaw) * sensorOffsetX - cos(yaw) * sensorOffsetY;
+  vehicleX = odomIn->pose.pose.position.x - cos(yaw) * sensorOffsetX +
+             sin(yaw) * sensorOffsetY;
+  vehicleY = odomIn->pose.pose.position.y - sin(yaw) * sensorOffsetX -
+             cos(yaw) * sensorOffsetY;
   vehicleZ = odomIn->pose.pose.position.z;
 
-  if ((fabs(roll) > inclThre * PI / 180.0 || fabs(pitch) > inclThre * PI / 180.0) && useInclToStop) {
+  if ((fabs(roll) > inclThre * PI / 180.0 ||
+       fabs(pitch) > inclThre * PI / 180.0) &&
+      useInclToStop) {
     stopInitTime = rclcpp::Time(odomIn->header.stamp).seconds();
   }
 
-  if ((fabs(odomIn->twist.twist.angular.x) > inclRateThre * PI / 180.0 || fabs(odomIn->twist.twist.angular.y) > inclRateThre * PI / 180.0) && useInclRateToSlow) {
+  if ((fabs(odomIn->twist.twist.angular.x) > inclRateThre * PI / 180.0 ||
+       fabs(odomIn->twist.twist.angular.y) > inclRateThre * PI / 180.0) &&
+      useInclRateToSlow) {
     slowInitTime = rclcpp::Time(odomIn->header.stamp).seconds();
   }
 }
 
-void pathHandler(const nav_msgs::msg::Path::ConstSharedPtr pathIn)
-{
+void pathHandler(const nav_msgs::msg::Path::ConstSharedPtr pathIn) {
   int pathSize = pathIn->poses.size();
   path.poses.resize(pathSize);
   for (int i = 0; i < pathSize; i++) {
@@ -146,15 +160,17 @@ void pathHandler(const nav_msgs::msg::Path::ConstSharedPtr pathIn)
   pathInit = true;
 }
 
-void joystickHandler(const sensor_msgs::msg::Joy::ConstSharedPtr joy)
-{
-  joyTime = nh->now().seconds(); 
+void joystickHandler(const sensor_msgs::msg::Joy::ConstSharedPtr joy) {
+  joyTime = nh->now().seconds();
   joySpeedRaw = sqrt(joy->axes[3] * joy->axes[3] + joy->axes[4] * joy->axes[4]);
   joySpeed = joySpeedRaw;
-  if (joySpeed > 1.0) joySpeed = 1.0;
-  if (joy->axes[4] == 0) joySpeed = 0;
+  if (joySpeed > 1.0)
+    joySpeed = 1.0;
+  if (joy->axes[4] == 0)
+    joySpeed = 0;
   joyYaw = joy->axes[3];
-  if (joySpeed == 0 && noRotAtStop) joyYaw = 0;
+  if (joySpeed == 0 && noRotAtStop)
+    joyYaw = 0;
 
   if (joy->axes[4] < 0 && !twoWayDrive) {
     joySpeed = 0;
@@ -168,26 +184,26 @@ void joystickHandler(const sensor_msgs::msg::Joy::ConstSharedPtr joy)
   }
 }
 
-void speedHandler(const std_msgs::msg::Float32::ConstSharedPtr speed)
-{
+void speedHandler(const std_msgs::msg::Float32::ConstSharedPtr speed) {
   double speedTime = nh->now().seconds();
-  if (autonomyMode && speedTime - joyTime > joyToSpeedDelay && joySpeedRaw == 0) {
+  if (autonomyMode && speedTime - joyTime > joyToSpeedDelay &&
+      joySpeedRaw == 0) {
     joySpeed = speed->data / maxSpeed;
 
-    if (joySpeed < 0) joySpeed = 0;
-    else if (joySpeed > 1.0) joySpeed = 1.0;
+    if (joySpeed < 0)
+      joySpeed = 0;
+    else if (joySpeed > 1.0)
+      joySpeed = 1.0;
   }
 }
 
-void stopHandler(const std_msgs::msg::Int8::ConstSharedPtr stop)
-{
+void stopHandler(const std_msgs::msg::Int8::ConstSharedPtr stop) {
   safetyStop = stop->data;
 }
 
-int main(int argc, char** argv)
-{
+int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  nh = rclcpp::Node::make_shared("pathFollower");
+  nh = rclcpp::Node::make_shared("iplanner_path_follower");
 
   nh->declare_parameter<double>("sensorOffsetX", sensorOffsetX);
   nh->declare_parameter<double>("sensorOffsetY", sensorOffsetY);
@@ -217,6 +233,8 @@ int main(int argc, char** argv)
   nh->declare_parameter<bool>("autonomyMode", autonomyMode);
   nh->declare_parameter<double>("autonomySpeed", autonomySpeed);
   nh->declare_parameter<double>("joyToSpeedDelay", joyToSpeedDelay);
+  nh->declare_parameter<bool>(
+      "offsetLookAheadBySensor", offsetLookAheadBySensor);
 
   nh->get_parameter("sensorOffsetX", sensorOffsetX);
   nh->get_parameter("sensorOffsetY", sensorOffsetY);
@@ -246,18 +264,37 @@ int main(int argc, char** argv)
   nh->get_parameter("autonomyMode", autonomyMode);
   nh->get_parameter("autonomySpeed", autonomySpeed);
   nh->get_parameter("joyToSpeedDelay", joyToSpeedDelay);
+  nh->get_parameter("offsetLookAheadBySensor", offsetLookAheadBySensor);
 
-  auto subOdom = nh->create_subscription<nav_msgs::msg::Odometry>("/state_estimation", 5, odomHandler);
+  nh->declare_parameter<std::string>("odomTopic", odomTopic);
+  nh->declare_parameter<std::string>("commandTopic", commandTopic);
+  nh->declare_parameter<double>("dirMomentum", dirMomentum);
 
-  auto subPath = nh->create_subscription<nav_msgs::msg::Path>("/path", 5, pathHandler);
+  nh->get_parameter("odomTopic", odomTopic);
+  nh->get_parameter("commandTopic", commandTopic);
+  nh->get_parameter("dirMomentum", dirMomentum);
 
-  auto subJoystick = nh->create_subscription<sensor_msgs::msg::Joy>("/joy", 5, joystickHandler);
+  if (offsetLookAheadBySensor) {
+    lookAheadDis += std::hypot(sensorOffsetX, sensorOffsetY);
+  }
 
-  auto subSpeed = nh->create_subscription<std_msgs::msg::Float32>("/speed", 5, speedHandler);
+  auto subOdom = nh->create_subscription<nav_msgs::msg::Odometry>(odomTopic, 5,
+                                                                  odomHandler);
 
-  auto subStop = nh->create_subscription<std_msgs::msg::Int8>("/stop", 5, stopHandler);
+  auto subPath =
+      nh->create_subscription<nav_msgs::msg::Path>("/path", 5, pathHandler);
 
-  auto pubSpeed = nh->create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel", 5);
+  auto subJoystick = nh->create_subscription<sensor_msgs::msg::Joy>(
+      "/joy", 5, joystickHandler);
+
+  auto subSpeed = nh->create_subscription<std_msgs::msg::Float32>("/speed", 5,
+                                                                  speedHandler);
+
+  auto subStop =
+      nh->create_subscription<std_msgs::msg::Int8>("/stop", 5, stopHandler);
+
+  auto pubSpeed =
+      nh->create_publisher<geometry_msgs::msg::TwistStamped>(commandTopic, 5);
 
   geometry_msgs::msg::TwistStamped cmd_vel;
   cmd_vel.header.frame_id = "vehicle";
@@ -265,8 +302,10 @@ int main(int argc, char** argv)
   if (autonomyMode) {
     joySpeed = autonomySpeed / maxSpeed;
 
-    if (joySpeed < 0) joySpeed = 0;
-    else if (joySpeed > 1.0) joySpeed = 1.0;
+    if (joySpeed < 0)
+      joySpeed = 0;
+    else if (joySpeed > 1.0)
+      joySpeed = 1.0;
   }
 
   rclcpp::Rate rate(100);
@@ -275,10 +314,10 @@ int main(int argc, char** argv)
     rclcpp::spin_some(nh);
 
     if (pathInit) {
-      float vehicleXRel = cos(vehicleYawRec) * (vehicleX - vehicleXRec) 
-                        + sin(vehicleYawRec) * (vehicleY - vehicleYRec);
-      float vehicleYRel = -sin(vehicleYawRec) * (vehicleX - vehicleXRec) 
-                        + cos(vehicleYawRec) * (vehicleY - vehicleYRec);
+      float vehicleXRel = cos(vehicleYawRec) * (vehicleX - vehicleXRec) +
+                          sin(vehicleYawRec) * (vehicleY - vehicleYRec);
+      float vehicleYRel = -sin(vehicleYawRec) * (vehicleX - vehicleXRec) +
+                          cos(vehicleYawRec) * (vehicleY - vehicleYRec);
 
       int pathSize = path.poses.size();
       float endDisX = path.poses[pathSize - 1].pose.position.x - vehicleXRel;
@@ -303,17 +342,23 @@ int main(int argc, char** argv)
       float pathDir = atan2(disY, disX);
 
       float dirDiff = vehicleYaw - vehicleYawRec - pathDir;
-      if (dirDiff > PI) dirDiff -= 2 * PI;
-      else if (dirDiff < -PI) dirDiff += 2 * PI;
-      if (dirDiff > PI) dirDiff -= 2 * PI;
-      else if (dirDiff < -PI) dirDiff += 2 * PI;
+      if (dirDiff > PI)
+        dirDiff -= 2 * PI;
+      else if (dirDiff < -PI)
+        dirDiff += 2 * PI;
+      if (dirDiff > PI)
+        dirDiff -= 2 * PI;
+      else if (dirDiff < -PI)
+        dirDiff += 2 * PI;
 
       if (twoWayDrive) {
         double time = nh->now().seconds();
-        if (fabs(dirDiff) > PI / 2 && navFwd && time - switchTime > switchTimeThre) {
+        if (fabs(dirDiff) > PI / 2 && navFwd &&
+            time - switchTime > switchTimeThre) {
           navFwd = false;
           switchTime = time;
-        } else if (fabs(dirDiff) < PI / 2 && !navFwd && time - switchTime > switchTimeThre) {
+        } else if (fabs(dirDiff) < PI / 2 && !navFwd &&
+                   time - switchTime > switchTimeThre) {
           navFwd = true;
           switchTime = time;
         }
@@ -322,15 +367,34 @@ int main(int argc, char** argv)
       float joySpeed2 = maxSpeed * joySpeed;
       if (!navFwd) {
         dirDiff += PI;
-        if (dirDiff > PI) dirDiff -= 2 * PI;
+        if (dirDiff > PI)
+          dirDiff -= 2 * PI;
         joySpeed2 *= -1;
       }
 
-      if (fabs(vehicleSpeed) < 2.0 * maxAccel / 100.0) vehicleYawRate = -stopYawRateGain * dirDiff;
-      else vehicleYawRate = -yawRateGain * dirDiff;
+      // Add momentum to dirDiff
+      if (fabs(dirDiff) > dirDiffThre - EPS && dis > lookAheadDis + EPS) {
+        if (lastDiffDir - dirDiff > PI)
+          dirDiff += 2 * PI;
+        else if (lastDiffDir - dirDiff < -PI)
+          dirDiff -= 2 * PI;
+        dirDiff = (1.0 - dirMomentum) * dirDiff + dirMomentum * lastDiffDir;
+        dirDiff =
+            std::max(std::min(dirDiff, (float)(PI - EPS)), (float)(-PI + EPS));
+        lastDiffDir = dirDiff;
+      } else {
+        lastDiffDir = 0.0;
+      }
 
-      if (vehicleYawRate > maxYawRate * PI / 180.0) vehicleYawRate = maxYawRate * PI / 180.0;
-      else if (vehicleYawRate < -maxYawRate * PI / 180.0) vehicleYawRate = -maxYawRate * PI / 180.0;
+      if (fabs(vehicleSpeed) < 2.0 * maxAccel / 100.0)
+        vehicleYawRate = -stopYawRateGain * dirDiff;
+      else
+        vehicleYawRate = -yawRateGain * dirDiff;
+
+      if (vehicleYawRate > maxYawRate * PI / 180.0)
+        vehicleYawRate = maxYawRate * PI / 180.0;
+      else if (vehicleYawRate < -maxYawRate * PI / 180.0)
+        vehicleYawRate = -maxYawRate * PI / 180.0;
 
       if (joySpeed2 == 0 && !autonomyMode) {
         vehicleYawRate = maxYawRate * joyYaw * PI / 180.0;
@@ -345,15 +409,22 @@ int main(int argc, char** argv)
       }
 
       float joySpeed3 = joySpeed2;
-      if (odomTime < slowInitTime + slowTime1 && slowInitTime > 0) joySpeed3 *= slowRate1;
-      else if (odomTime < slowInitTime + slowTime1 + slowTime2 && slowInitTime > 0) joySpeed3 *= slowRate2;
+      if (odomTime < slowInitTime + slowTime1 && slowInitTime > 0)
+        joySpeed3 *= slowRate1;
+      else if (odomTime < slowInitTime + slowTime1 + slowTime2 &&
+               slowInitTime > 0)
+        joySpeed3 *= slowRate2;
 
       if (fabs(dirDiff) < dirDiffThre && dis > stopDisThre) {
-        if (vehicleSpeed < joySpeed3) vehicleSpeed += maxAccel / 100.0;
-        else if (vehicleSpeed > joySpeed3) vehicleSpeed -= maxAccel / 100.0;
+        if (vehicleSpeed < joySpeed3)
+          vehicleSpeed += maxAccel / 100.0;
+        else if (vehicleSpeed > joySpeed3)
+          vehicleSpeed -= maxAccel / 100.0;
       } else {
-        if (vehicleSpeed > 0) vehicleSpeed -= maxAccel / 100.0;
-        else if (vehicleSpeed < 0) vehicleSpeed += maxAccel / 100.0;
+        if (vehicleSpeed > 0)
+          vehicleSpeed -= maxAccel / 100.0;
+        else if (vehicleSpeed < 0)
+          vehicleSpeed += maxAccel / 100.0;
       }
 
       if (odomTime < stopInitTime + stopTime && stopInitTime > 0) {
@@ -361,14 +432,19 @@ int main(int argc, char** argv)
         vehicleYawRate = 0;
       }
 
-      if (safetyStop >= 1) vehicleSpeed = 0;
-      if (safetyStop >= 2) vehicleYawRate = 0;
+      if (safetyStop >= 1)
+        vehicleSpeed = 0;
+      if (safetyStop >= 2)
+        vehicleYawRate = 0;
 
       pubSkipCount--;
       if (pubSkipCount < 0) {
-        cmd_vel.header.stamp = rclcpp::Time(static_cast<uint64_t>(odomTime * 1e9));
-        if (fabs(vehicleSpeed) <= maxAccel / 100.0) cmd_vel.twist.linear.x = 0;
-        else cmd_vel.twist.linear.x = vehicleSpeed;
+        cmd_vel.header.stamp =
+            rclcpp::Time(static_cast<uint64_t>(odomTime * 1e9));
+        if (fabs(vehicleSpeed) <= maxAccel / 100.0)
+          cmd_vel.twist.linear.x = 0;
+        else
+          cmd_vel.twist.linear.x = vehicleSpeed;
         cmd_vel.twist.angular.z = vehicleYawRate;
         pubSpeed->publish(cmd_vel);
 
