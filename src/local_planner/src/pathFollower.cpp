@@ -203,7 +203,7 @@ void stopHandler(const std_msgs::msg::Int8::ConstSharedPtr stop) {
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  nh = rclcpp::Node::make_shared("iplanner_path_follower");
+  nh = rclcpp::Node::make_shared("path_follower");
 
   nh->declare_parameter<double>("sensorOffsetX", sensorOffsetX);
   nh->declare_parameter<double>("sensorOffsetY", sensorOffsetY);
@@ -233,8 +233,8 @@ int main(int argc, char **argv) {
   nh->declare_parameter<bool>("autonomyMode", autonomyMode);
   nh->declare_parameter<double>("autonomySpeed", autonomySpeed);
   nh->declare_parameter<double>("joyToSpeedDelay", joyToSpeedDelay);
-  nh->declare_parameter<bool>(
-      "offsetLookAheadBySensor", offsetLookAheadBySensor);
+  nh->declare_parameter<bool>("offsetLookAheadBySensor",
+                              offsetLookAheadBySensor);
 
   nh->get_parameter("sensorOffsetX", sensorOffsetX);
   nh->get_parameter("sensorOffsetY", sensorOffsetY);
